@@ -11,23 +11,34 @@ lib.premultiply_safe.argtypes = [
 lib.premultiply_safe.restype = ctypes.c_int
 
 def reference_premultiply(pixels):
+    """Pillow's actual C formula — NOT Python // division"""
     result = bytearray(pixels)
     for i in range(0, len(result), 4):
         a = result[i+3]
-        result[i]   = result[i]   * a // 255
-        result[i+1] = result[i+1] * a // 255
-        result[i+2] = result[i+2] * a // 255
+        for ch in range(3):
+            v = result[i+ch]
+            tmp = v * a + 128
+            result[i+ch] = (tmp + (tmp >> 8)) >> 8
     return bytes(result)
+
+def pillow_premultiply(pixels, width, height):
+    """Ground truth: actual Pillow convert to RGBa (premultiplied)"""
+    arr = np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, 4)
+    img = Image.fromarray(arr, 'RGBA')
+    img_pre = img.convert('RGBa')  # Pillow's internal premultiply
+    return img_pre.tobytes()
 
 def asm_premultiply(pixels, width, height):
     data = bytearray(pixels)
-    # pass pointer directly into bytearray buffer — no copy
     arr = (ctypes.c_uint8 * len(data)).from_buffer(data)
     lib.premultiply_safe(arr, width, height, width*4)
     return bytes(data)
 
-def run_test(name, pixels, width, height):
-    ref = reference_premultiply(pixels)
+def run_test(name, pixels, width, height, use_pillow=False):
+    if use_pillow:
+        ref = pillow_premultiply(pixels, width, height)
+    else:
+        ref = reference_premultiply(pixels)
     asm = asm_premultiply(pixels, width, height)
 
     if ref == asm:
@@ -50,7 +61,7 @@ def run_test(name, pixels, width, height):
         print(f"    pixel {px}: ref={tuple(r)} asm={tuple(a)}")
     return False
 
-print("=== Correctness Tests ===\n")
+print("=== Correctness Tests (reference = Pillow C formula) ===\n")
 passed = 0
 total = 0
 
@@ -110,9 +121,17 @@ if r1 == -1 and r2 == -1 and r3 == -1:
 else:
     print(f"  FAIL: safety r1={r1} r2={r2} r3={r3}")
 
+print("\n=== Ground Truth: validate against actual Pillow output ===\n")
+np.random.seed(99)
+for name, w, h in [("8x8", 8, 8), ("100x100", 100, 100), ("1920x1080", 1920, 1080)]:
+    pixels = bytes(np.random.randint(0, 255, 4*w*h, dtype=np.uint8))
+    total += 1
+    if run_test(f"vs actual Pillow {name}", pixels, w, h, use_pillow=True):
+        passed += 1
+
 print(f"\n=== Results: {passed}/{total} passed ===")
 if passed == total:
-    print("All tests passed — ASM output is pixel-exact.")
+    print("All tests passed — ASM matches Pillow exactly.")
 else:
     print("FAILURES detected — do not ship.")
     sys.exit(1)
